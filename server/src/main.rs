@@ -105,11 +105,15 @@ async fn process_link(
     let download_path_str = download_path.to_str().ok_or("cannot convert path")?;
     cmd.arg("-o")
         .arg(&download_path)
-        .arg(link.url.as_str())
         .arg("--max-downloads")
         .arg("1")
+        .arg("-f")
+        .arg("ba*") // best audio
+        .arg("-S")
+        .arg("+res:720") // 720p max
         .arg("--exec")
-        .arg(format!("mv {{}} {download_path_str}"));
+        .arg(format!("mv {{}} {download_path_str}"))
+        .arg(link.url.as_str());
 
     debug!("yt-dlp command {:?}", cmd);
 
@@ -119,6 +123,7 @@ async fn process_link(
         return Err("downloaded file not found".into());
     }
 
+    debug!("hashig file");
     let hash = hash_file(&download_path)?;
     let hash_insert = Some(hash.clone());
 
@@ -138,6 +143,8 @@ async fn process_link(
             .execute(conn)
     })
     .await??;
+
+    debug!("transcoding {}", &transcode_path.to_string_lossy());
 
     if !result.is_empty() {
         let other_link = result.first().unwrap();
@@ -173,25 +180,21 @@ async fn process_link(
         }
 
         let mut command = Command::new("ffmpeg");
+
         command.arg("-i").arg(&download_path);
+
+        let mut complex_filter = false;
 
         if video_stream.is_none()
         // && let Some(audio_stream) = audio_stream
         {
             let mut image_path = PathBuf::from(&download_path);
-            image_path.add_extension(".png");
+            image_path.add_extension("png");
 
-            let _ = Command::new("ffmpeg")
-                .arg("-i")
-                .arg(&download_path)
-                .arg(&image_path)
-                .output()
-                .await?;
+            let _ = Command::new("ffmpeg").arg(&image_path).output().await?;
 
             if image_path.exists() {
                 command
-                    .arg("-loop")
-                    .arg("1")
                     .arg("-i")
                     .arg(&image_path)
                     .arg("-map")
@@ -200,18 +203,21 @@ async fn process_link(
                     .arg("1:v:0")
                     .arg("-pix_fmt")
                     .arg("yuv420p")
-                    .arg("-vf")
-                    .arg("scale=1080:-2:flags=lanczos")
                     .arg("-tune")
                     .arg("stillimage");
             } else {
                 command
-                    .arg("filter_complex")
+                    .arg("-filter_complex")
                     .arg("[0:a]avectorscope=s=1280x720");
+                complex_filter = true;
             }
         }
 
-        let result = command
+        if !complex_filter {
+            command.arg("-vf").arg("scale=-2:720:flags=lanczos");
+        }
+
+        command
             .arg("-movflags")
             .arg("faststart")
             .arg("-c:v")
@@ -223,12 +229,14 @@ async fn process_link(
             .arg("-c:a")
             .arg("aac")
             .arg("-b:a")
-            .arg("320k")
+            .arg("280k")
             .arg("-f")
             .arg("mp4")
-            .arg(&transcode_path)
-            .output()
-            .await?;
+            .arg(&transcode_path);
+
+        debug!("ffmpeg command: {:?}", command);
+
+        let result = command.output().await?;
 
         debug!("ffmpeg result: {:?}", result);
     }

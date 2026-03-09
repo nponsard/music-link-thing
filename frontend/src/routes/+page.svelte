@@ -16,11 +16,12 @@
 		links = await fetch_links();
 	}
 
-	const delete_func = $derived(async (id: string) => {
+	async function delete_func(id: string) {
 		await delete_link(id);
 
 		links = await fetch_links();
-	});
+		console.log(links);
+	}
 </script>
 
 {#each links as link (link.id)}

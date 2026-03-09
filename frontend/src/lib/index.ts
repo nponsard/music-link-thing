@@ -16,14 +16,14 @@ export function backend_url() {
 export async function fetch_links(): Promise<Link[]> {
 	const base = backend_url();
 
-	const result = await fetch( `${base}/api/links`);
+	const result = await fetch(`${base}/api/links`);
 	return await result.json();
 }
 
 export async function add_link(url: string): Promise<Link> {
 	const base = backend_url();
 
-	const result = await fetch( `${base}/api/link`, {
+	const result = await fetch(`${base}/api/link`, {
 		method: 'POST',
 		body: JSON.stringify({ url }),
 		headers: {
@@ -33,11 +33,10 @@ export async function add_link(url: string): Promise<Link> {
 	return await result.json();
 }
 
-export async function delete_link(id: string): Promise<Link> {
+export async function delete_link(id: string) {
 	const base = backend_url();
 
-	const result = await fetch(`${base}/api/link/${id}`, {
+	await fetch(`${base}/api/link/${id}`, {
 		method: 'DELETE'
 	});
-	return await result.json();
 }

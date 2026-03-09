@@ -1,4 +1,9 @@
-use std::{error::Error, net::SocketAddr, path::PathBuf, process::Output};
+use std::{
+    error::Error,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Output,
+};
 
 use axum::{
     Json, Router,
@@ -10,7 +15,7 @@ use deadpool_diesel::Pool;
 use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use dotenvy::dotenv;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use tokio::{fs, process::Command, sync::mpsc::Sender};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::error;
@@ -36,6 +41,17 @@ struct FfprobeStream {
     avg_frame_rate: String,
     codec_type: String,
 }
+
+fn hash_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(path)?;
+
+    let _ = std::io::copy(&mut file, &mut hasher)?;
+    let hash_bytes = hasher.finalize();
+
+    Ok(hex::encode(hash_bytes))
+}
+
 async fn process_link(
     pool: &Pool<deadpool_diesel::Manager<SqliteConnection>>,
     link: &Link,
@@ -45,6 +61,32 @@ async fn process_link(
     use crate::schema::links;
     let download_path = PathBuf::from(download_folder).join(link.id.as_str());
     let transcode_path = PathBuf::from(transcode_folder).join(link.id.as_str());
+    let conn = pool.get().await?;
+
+    let url = link.url.clone();
+    let result = conn
+        .interact(|conn| links::table.filter(links::url.eq(url)).load::<Link>(conn))
+        .await??;
+
+    if !result.is_empty() {
+        let other_link = result.first().unwrap();
+        let other_transcode_path = PathBuf::from(transcode_folder).join(other_link.id.as_str());
+        Command::new("cp")
+            .arg("--reflink=always")
+            .arg(other_transcode_path)
+            .arg(&transcode_path);
+        let hash = other_link.original_hash.clone();
+        let id = link.id.clone();
+        conn.interact(|conn| {
+            diesel::update(links::dsl::links)
+                .filter(links::dsl::id.eq(id))
+                .set(links::dsl::original_hash.eq(hash))
+                .execute(conn)
+        })
+        .await??;
+
+        return Ok(());
+    }
 
     let _ = Command::new("yt-dlp")
         .arg("-o")
@@ -57,9 +99,17 @@ async fn process_link(
         return Err("downloaded file not found".into());
     }
 
-    let hash = hex::encode(sha2::Sha256::digest(fs::read(&download_path).await?));
+    let hash = hash_file(&download_path)?;
+    let hash_insert = Some(hash.clone());
 
-    let conn = pool.get().await?;
+    let id = link.id.clone();
+    conn.interact(|conn| {
+        diesel::update(links::dsl::links)
+            .filter(links::dsl::id.eq(id))
+            .set(links::dsl::original_hash.eq(hash_insert))
+            .execute(conn)
+    })
+    .await??;
 
     let result = conn
         .interact(|conn| {
@@ -142,6 +192,8 @@ async fn process_link(
         }
 
         command
+            .arg("-movflags")
+            .arg("faststart")
             .arg("-c:v")
             .arg("libx264")
             .arg("-preset")
@@ -233,8 +285,8 @@ async fn main() {
     // build our application with some routes
 
     let api = Router::new()
-        .route("links", get(list_links))
-        .route("link", post(create_link))
+        .route("/links", get(list_links))
+        .route("/link", post(create_link))
         .with_state(AppState { pool, control_tx });
     let app = Router::new()
         .nest("/api", api)

@@ -27,11 +27,12 @@ RUN useradd -ms /bin/bash user -u 1000
 
 RUN apt-get update && apt-get install -y ffmpeg yt-dlp && apt-get clean
 
+RUN mkdir -p /app/server/frontend
+USER user 
 COPY --chown=1000:1000 --from=server-builder /server/target/release/server /app/server
+
 COPY --chown=1000:1000 --from=frontend-builder /frontend/build/. /app/server/frontend
 
 ENV FRONTEND_FOLDER=/app/server/frontend
 
 EXPOSE 3000
-
-USER user 

@@ -1,0 +1,16 @@
+services:
+  links:
+    build: .
+    restart: unless-stopped
+    expose:
+      - 3000
+    ports:
+      - "3000:3000"
+    environment:
+      - TRANSCODE_FOLDER=/transcode
+      - DOWNLOAD_FOLDER=/download 
+      - DATABASE_URL=/database/links-database.db
+    volumes:
+      - "./transcode:/transcode"
+      - "./database:/database"
+      - "./download:/download"

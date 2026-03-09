@@ -7,9 +7,9 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
+    extract::{self, State},
+    http::{Method, StatusCode, header::CONTENT_TYPE},
+    routing::{delete, get, post},
 };
 use deadpool_diesel::Pool;
 use diesel::prelude::*;
@@ -17,8 +17,11 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use dotenvy::dotenv;
 use sha2::{Digest, Sha256};
 use tokio::{fs, process::Command, sync::mpsc::Sender};
-use tower_http::services::{ServeDir, ServeFile};
-use tracing::error;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    services::{ServeDir, ServeFile},
+};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod models;
@@ -59,17 +62,27 @@ async fn process_link(
     transcode_folder: &String,
 ) -> Result<(), Box<dyn Error>> {
     use crate::schema::links;
+
     let download_path = PathBuf::from(download_folder).join(link.id.as_str());
     let transcode_path = PathBuf::from(transcode_folder).join(link.id.as_str());
     let conn = pool.get().await?;
 
-    let url = link.url.clone();
+    let url: String = link.url.clone();
+    let id: String = link.id.clone();
+
+    info!("processing {}", &url);
     let result = conn
-        .interact(|conn| links::table.filter(links::url.eq(url)).load::<Link>(conn))
+        .interact(|conn| {
+            links::table
+                .filter(links::url.eq(url))
+                .filter(links::id.ne(id))
+                .load::<Link>(conn)
+        })
         .await??;
 
     if !result.is_empty() {
         let other_link = result.first().unwrap();
+        debug!("found similar link: {:?}", other_link);
         let other_transcode_path = PathBuf::from(transcode_folder).join(other_link.id.as_str());
         Command::new("cp")
             .arg("--reflink=always")
@@ -88,12 +101,19 @@ async fn process_link(
         return Ok(());
     }
 
-    let _ = Command::new("yt-dlp")
-        .arg("-o")
+    let mut cmd = Command::new("yt-dlp");
+    let download_path_str = download_path.to_str().ok_or("cannot convert path")?;
+    cmd.arg("-o")
         .arg(&download_path)
         .arg(link.url.as_str())
-        .output()
-        .await?;
+        .arg("--max-downloads")
+        .arg("1")
+        .arg("--exec")
+        .arg(format!("mv {{}} {download_path_str}"));
+
+    debug!("yt-dlp command {:?}", cmd);
+
+    let _ = cmd.output().await?;
 
     if !download_path.exists() {
         return Err("downloaded file not found".into());
@@ -103,13 +123,6 @@ async fn process_link(
     let hash_insert = Some(hash.clone());
 
     let id = link.id.clone();
-    conn.interact(|conn| {
-        diesel::update(links::dsl::links)
-            .filter(links::dsl::id.eq(id))
-            .set(links::dsl::original_hash.eq(hash_insert))
-            .execute(conn)
-    })
-    .await??;
 
     let result = conn
         .interact(|conn| {
@@ -118,6 +131,13 @@ async fn process_link(
                 .load::<Link>(conn)
         })
         .await??;
+    conn.interact(|conn| {
+        diesel::update(links::dsl::links)
+            .filter(links::dsl::id.eq(id))
+            .set(links::dsl::original_hash.eq(hash_insert))
+            .execute(conn)
+    })
+    .await??;
 
     if !result.is_empty() {
         let other_link = result.first().unwrap();
@@ -191,20 +211,26 @@ async fn process_link(
             }
         }
 
-        command
+        let result = command
             .arg("-movflags")
             .arg("faststart")
             .arg("-c:v")
             .arg("libx264")
             .arg("-preset")
-            .arg("fast")
+            .arg("veryfast")
+            .arg("-crf")
+            .arg("28")
             .arg("-c:a")
             .arg("aac")
             .arg("-b:a")
             .arg("320k")
             .arg("-f")
             .arg("mp4")
-            .arg(&transcode_path);
+            .arg(&transcode_path)
+            .output()
+            .await?;
+
+        debug!("ffmpeg result: {:?}", result);
     }
 
     fs::remove_file(download_path).await?;
@@ -219,7 +245,11 @@ async fn tasks_manager(
     transcode_folder: String,
 ) {
     while let Some(link) = control_rx.recv().await {
-        if let Err(e) = process_link(&pool, &link, &download_folder, &transcode_folder).await {
+        debug!("received {:?}", link);
+        let result = process_link(&pool, &link, &download_folder, &transcode_folder).await;
+        debug!("processing result: {:?}", result);
+
+        if let Err(e) = result {
             error!("Failed to process link {},{}", link.url, e.to_string())
         }
     }
@@ -229,6 +259,7 @@ async fn tasks_manager(
 struct AppState {
     pool: Pool<deadpool_diesel::Manager<SqliteConnection>>,
     control_tx: Sender<Link>,
+    transcode_folder: String,
 }
 
 #[tokio::main]
@@ -247,6 +278,8 @@ async fn main() {
     let download_folder = std::env::var("DOWNLOAD_FOLDER").unwrap_or("./download".to_string());
     let transcode_folder = std::env::var("TRANSCODE_FOLDER").unwrap_or("./transcode".to_string());
     let frontend_folder = std::env::var("FRONTEND_FOLDER").unwrap_or("./frontend".to_string());
+
+    fs::create_dir_all(&transcode_folder).await.unwrap();
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(128);
 
@@ -277,21 +310,32 @@ async fn main() {
         .await
     });
 
-    let frondend_dir = ServeDir::new(&frontend_folder)
-        .not_found_service(ServeFile::new(format!("{}/index.html", &frontend_folder)));
+    let cors = CorsLayer::new()
+        .allow_headers([CONTENT_TYPE])
+        .allow_methods([Method::POST, Method::GET, Method::DELETE])
+        .allow_origin(Any);
 
-    let transcode_dir = ServeDir::new(transcode_folder);
+    let frondend_dir = ServeDir::new(&frontend_folder)
+        .not_found_service(ServeFile::new(format!("{}/200.html", &frontend_folder)));
+
+    let transcode_dir = ServeDir::new(transcode_folder.clone());
 
     // build our application with some routes
 
     let api = Router::new()
         .route("/links", get(list_links))
         .route("/link", post(create_link))
-        .with_state(AppState { pool, control_tx });
+        .route("/link/{id}", delete(delete_link))
+        .with_state(AppState {
+            pool,
+            control_tx,
+            transcode_folder,
+        });
     let app = Router::new()
         .nest("/api", api)
         .nest_service("/transcode", transcode_dir)
-        .fallback_service(frondend_dir);
+        .fallback_service(frondend_dir)
+        .layer(cors);
 
     // run it with hyper
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -351,6 +395,45 @@ async fn create_link(
         .await
         .map_err(internal_error)?;
     Ok(Json(res))
+}
+
+#[axum::debug_handler]
+async fn delete_link(
+    State(app_state): State<AppState>,
+    extract::Path(link_id): extract::Path<String>,
+) -> Result<(), (StatusCode, String)> {
+    use crate::schema::links;
+
+    let conn = app_state.pool.get().await.map_err(internal_error)?;
+
+    let id = link_id;
+
+    debug!("deleting {}", id);
+
+    let res = conn
+        .interact(|conn| {
+            diesel::delete(links::table)
+                .filter(links::dsl::id.eq(id))
+                .returning(Link::as_returning())
+                .get_result(conn)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+    let transcode_path = PathBuf::from(app_state.transcode_folder).join(res.id);
+
+    let res = fs::remove_file(&transcode_path).await;
+
+    match res {
+        Ok(()) => {
+            debug!("deleted {:?}", transcode_path.to_str())
+        }
+        Err(e) => {
+            warn!("error when deleting file: {:?}", e);
+        }
+    }
+
+    Ok(())
 }
 
 fn internal_error<E>(err: E) -> (StatusCode, String)

@@ -25,7 +25,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN useradd -ms /bin/bash user -u 1000
 
-RUN apt-get update && apt-get install -y ffmpeg yt-dlp && apt-get clean
+RUN apt-get update && apt-get install -y ffmpeg curl wget unzip && apt-get clean
+
+RUN curl -fsSL https://deno.land/install.sh | sh
+RUN mv /root/.deno/bin/deno /usr/bin/deno
+RUN chmod a+rx /usr/bin/deno
+
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/bin/yt-dlp \
+  && chmod a+rx /usr/bin/yt-dlp 
 
 RUN mkdir -p /app/frontend
 USER user 

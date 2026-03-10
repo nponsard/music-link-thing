@@ -25,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN useradd -ms /bin/bash user -u 1000
 
-RUN apt-get update && apt-get install -y ffmpeg curl wget unzip && apt-get clean
+RUN apt-get update && apt-get install -y ffmpeg curl wget unzip python3 && apt-get clean
 
 RUN curl -fsSL https://deno.land/install.sh | sh
 RUN mv /root/.deno/bin/deno /usr/bin/deno

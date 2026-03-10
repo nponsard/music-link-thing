@@ -194,7 +194,12 @@ async fn process_link(
             let mut image_path = PathBuf::from(&download_path);
             image_path.add_extension("png");
 
-            let out = Command::new("ffmpeg").arg(&image_path).output().await?;
+            let out = Command::new("ffmpeg")
+                .arg("-i")
+                .arg(&download_path)
+                .arg(&image_path)
+                .output()
+                .await?;
 
             debug!("thumbnail extraction: {:?}", out);
 

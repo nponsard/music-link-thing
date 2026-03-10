@@ -64,6 +64,9 @@ async fn process_link(
     use crate::schema::links;
 
     let download_path = PathBuf::from(download_folder).join(link.id.as_str());
+    let tmp_download_path = PathBuf::from(download_folder)
+        .join("tmp")
+        .join(link.id.as_str());
     let transcode_path = PathBuf::from(transcode_folder).join(link.id.as_str());
     let conn = pool.get().await?;
 
@@ -104,7 +107,7 @@ async fn process_link(
     let mut cmd = Command::new("yt-dlp");
     let download_path_str = download_path.to_str().ok_or("cannot convert path")?;
     cmd.arg("-o")
-        .arg(&download_path)
+        .arg(&tmp_download_path)
         .arg("--max-downloads")
         .arg("1")
         .arg("-f")
@@ -191,7 +194,9 @@ async fn process_link(
             let mut image_path = PathBuf::from(&download_path);
             image_path.add_extension("png");
 
-            let _ = Command::new("ffmpeg").arg(&image_path).output().await?;
+            let out = Command::new("ffmpeg").arg(&image_path).output().await?;
+
+            debug!("thumbnail extraction: {:?}", out);
 
             if image_path.exists() {
                 command

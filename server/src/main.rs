@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Output,
@@ -7,16 +6,21 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{self, State},
-    http::{Method, StatusCode, header::CONTENT_TYPE},
+    extract::{self, RawQuery, State},
+    http::{
+        self, HeaderMap, HeaderValue, Method, Response, StatusCode,
+        header::{self, CONTENT_TYPE},
+    },
+    response::IntoResponse,
     routing::{delete, get, post},
 };
-use deadpool_diesel::Pool;
-use diesel::prelude::*;
+use deadpool_diesel::{InteractError, Pool, PoolError};
+use diesel::{prelude::*, result};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use dotenvy::dotenv;
 use sha2::{Digest, Sha256};
 use tokio::{fs, process::Command, sync::mpsc::Sender};
+use tokio_util::io::ReaderStream;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -55,12 +59,21 @@ fn hash_file(path: &Path) -> Result<String, std::io::Error> {
     Ok(hex::encode(hash_bytes))
 }
 
+// TODO: improve error management
+#[derive(Debug)]
+enum CustomErrors {
+    Diesel(diesel::result::Error),
+    Deadpool(InteractError),
+    DeadpoolPool(PoolError),
+    Custom(String),
+}
+
 async fn process_link(
     pool: &Pool<deadpool_diesel::Manager<SqliteConnection>>,
     link: &Link,
     download_folder: &String,
     transcode_folder: &String,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), CustomErrors> {
     use crate::schema::links;
 
     let download_path = PathBuf::from(download_folder).join(link.id.as_str());
@@ -68,7 +81,7 @@ async fn process_link(
         .join("tmp")
         .join(link.id.as_str());
     let transcode_path = PathBuf::from(transcode_folder).join(link.id.as_str());
-    let conn = pool.get().await?;
+    let conn = pool.get().await.map_err(CustomErrors::DeadpoolPool)?;
 
     let url: String = link.url.clone();
     let id: String = link.id.clone();
@@ -81,8 +94,9 @@ async fn process_link(
                 .filter(links::id.ne(id))
                 .load::<Link>(conn)
         })
-        .await??;
-
+        .await
+        .map_err(CustomErrors::Deadpool)?
+        .map_err(CustomErrors::Diesel)?;
     if !result.is_empty() {
         let other_link = result.first().unwrap();
         debug!("found similar link: {:?}", other_link);
@@ -99,13 +113,17 @@ async fn process_link(
                 .set(links::dsl::original_hash.eq(hash))
                 .execute(conn)
         })
-        .await??;
+        .await
+        .map_err(|e| CustomErrors::Deadpool(e))?
+        .map_err(|e| CustomErrors::Diesel(e))?;
 
         return Ok(());
     }
 
     let mut cmd = Command::new("yt-dlp");
-    let download_path_str = download_path.to_str().ok_or("cannot convert path")?;
+    let download_path_str = download_path
+        .to_str()
+        .ok_or(CustomErrors::Custom("cannot convert path".to_string()))?;
     cmd.arg("-o")
         .arg(&tmp_download_path)
         .arg("--max-downloads")
@@ -120,14 +138,17 @@ async fn process_link(
 
     debug!("yt-dlp command {:?}", cmd);
 
-    let _ = cmd.output().await?;
+    let _ = cmd
+        .output()
+        .await
+        .map_err(|e| CustomErrors::Custom(e.to_string()));
 
     if !download_path.exists() {
-        return Err("downloaded file not found".into());
+        return Err(CustomErrors::Custom("downloaded file not found".into()));
     }
 
     debug!("hashig file");
-    let hash = hash_file(&download_path)?;
+    let hash = hash_file(&download_path).map_err(|e| CustomErrors::Custom(e.to_string()))?;
     let hash_insert = Some(hash.clone());
 
     let id = link.id.clone();
@@ -138,14 +159,18 @@ async fn process_link(
                 .filter(links::original_hash.eq(hash))
                 .load::<Link>(conn)
         })
-        .await??;
+        .await
+        .map_err(|e| CustomErrors::Deadpool(e))?
+        .map_err(|e| CustomErrors::Diesel(e))?;
     conn.interact(|conn| {
         diesel::update(links::dsl::links)
             .filter(links::dsl::id.eq(id))
             .set(links::dsl::original_hash.eq(hash_insert))
             .execute(conn)
     })
-    .await??;
+    .await
+    .map_err(|e| CustomErrors::Deadpool(e))?
+    .map_err(|e| CustomErrors::Diesel(e))?;
 
     debug!("transcoding {}", &transcode_path.to_string_lossy());
 
@@ -166,9 +191,11 @@ async fn process_link(
             .arg("-show_streams")
             .arg(&download_path)
             .output()
-            .await?;
+            .await
+            .map_err(|e| CustomErrors::Custom(e.to_string()))?;
 
-        let parsed: FfprobeOutput = serde_json::from_slice(&stdout)?;
+        let parsed: FfprobeOutput =
+            serde_json::from_slice(&stdout).map_err(|e| CustomErrors::Custom(e.to_string()))?;
 
         let mut video_stream = None;
         let mut audio_stream = None;
@@ -199,26 +226,34 @@ async fn process_link(
                 .arg(&download_path)
                 .arg(&image_path)
                 .output()
-                .await?;
+                .await
+                .map_err(|e| CustomErrors::Custom(e.to_string()))?;
 
             debug!("thumbnail extraction: {:?}", out);
 
             if image_path.exists() {
                 command
+                    .arg("-loop")
+                    .arg("1")
+                    .arg("-framerate")
+                    .arg("10")
                     .arg("-i")
                     .arg(&image_path)
                     .arg("-map")
-                    .arg("0:a:0")
+                    .arg("1:v:0") // put video first
                     .arg("-map")
-                    .arg("1:v:0")
-                    .arg("-pix_fmt")
-                    .arg("yuv420p")
+                    .arg("0:a:0")
                     .arg("-tune")
-                    .arg("stillimage");
+                    .arg("stillimage")
+                    .arg("-shortest")
+                    .arg("-shortest_buf_duration")
+                    .arg("60");
+                // .arg("-r")
+                // .arg("5");
             } else {
                 command
                     .arg("-filter_complex")
-                    .arg("[0:a]avectorscope=s=1280x720");
+                    .arg("[0:a]a3dscope=s=848x480:r=24");
                 complex_filter = true;
             }
         }
@@ -228,6 +263,8 @@ async fn process_link(
         }
 
         command
+            .arg("-pix_fmt")
+            .arg("yuv420p")
             .arg("-movflags")
             .arg("faststart")
             .arg("-c:v")
@@ -237,21 +274,26 @@ async fn process_link(
             .arg("-crf")
             .arg("28")
             .arg("-c:a")
-            .arg("aac")
+            .arg("libopus")
             .arg("-b:a")
-            .arg("280k")
+            .arg("192k")
             .arg("-f")
             .arg("mp4")
             .arg(&transcode_path);
 
         debug!("ffmpeg command: {:?}", command);
 
-        let result = command.output().await?;
+        let result = command
+            .output()
+            .await
+            .map_err(|e| CustomErrors::Custom(e.to_string()))?;
 
         debug!("ffmpeg result: {:?}", result);
     }
 
-    fs::remove_file(download_path).await?;
+    fs::remove_file(download_path)
+        .await
+        .map_err(|e| CustomErrors::Custom(e.to_string()))?;
 
     Ok(())
 }
@@ -268,7 +310,7 @@ async fn tasks_manager(
         debug!("processing result: {:?}", result);
 
         if let Err(e) = result {
-            error!("Failed to process link {},{}", link.url, e.to_string())
+            error!("Failed to process link {},{:?}", link.url, e)
         }
     }
 }
@@ -278,6 +320,7 @@ struct AppState {
     pool: Pool<deadpool_diesel::Manager<SqliteConnection>>,
     control_tx: Sender<Link>,
     transcode_folder: String,
+    download_folder: String,
 }
 
 #[tokio::main]
@@ -318,11 +361,12 @@ async fn main() {
     }
     let task_pool = pool.clone();
     let transcode_folder_clone = transcode_folder.clone();
+    let download_folder_clone = download_folder.clone();
     tokio::spawn(async move {
         tasks_manager(
             task_pool,
             &mut control_rx,
-            download_folder,
+            download_folder_clone,
             transcode_folder_clone,
         )
         .await
@@ -344,10 +388,12 @@ async fn main() {
         .route("/links", get(list_links))
         .route("/link", post(create_link))
         .route("/link/{id}", delete(delete_link))
+        .route("/direct/{*url}", get(direct_request))
         .with_state(AppState {
             pool,
             control_tx,
             transcode_folder,
+            download_folder,
         });
     let app = Router::new()
         .nest("/api", api)
@@ -413,6 +459,102 @@ async fn create_link(
         .await
         .map_err(internal_error)?;
     Ok(Json(res))
+}
+
+#[axum::debug_handler]
+async fn direct_request(
+    State(app_state): State<AppState>,
+    extract::Path(root_url): extract::Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // FIXME: find a way to have axum not interpret query parameters
+    let url = match query {
+        Some(q) => format!("{}?{}", root_url, q),
+        None => root_url,
+    };
+
+    info!("direct request on {}", url);
+    use crate::schema::links;
+
+    let conn = app_state.pool.get().await.map_err(internal_error)?;
+    let url_clone = url.clone();
+    let result = conn
+        .interact(|conn| {
+            links::table
+                .filter(links::url.eq(url_clone))
+                .load::<Link>(conn)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+    let link = if let Some(link) = result.first() {
+        link.clone()
+    } else {
+        let link = Link {
+            url,
+            id: hex::encode(Uuid::new_v4().as_bytes()),
+            original_hash: None,
+            transcoded_hash: None,
+        };
+
+        let link_insert = link.clone();
+        let _ = conn
+            .interact(|conn| {
+                diesel::insert_into(links::table)
+                    .values(link_insert)
+                    .returning(Link::as_returning())
+                    .get_result(conn)
+            })
+            .await
+            .map_err(internal_error)?
+            .map_err(internal_error)?;
+        link
+    };
+
+    let res = process_link(
+        &app_state.pool,
+        &link,
+        &app_state.download_folder,
+        &app_state.transcode_folder,
+    )
+    .await;
+
+    match res {
+        Ok(()) => {}
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)));
+        }
+    }
+
+    let transcoded_path = PathBuf::from(app_state.transcode_folder).join(link.id);
+
+    let file = match tokio::fs::File::open(transcoded_path).await {
+        Ok(file) => file,
+        Err(err) => return Err((StatusCode::NOT_FOUND, format!("File not found: {}", err))),
+    };
+    // // convert the `AsyncRead` into a `Stream`
+    let stream = ReaderStream::new(file);
+    // // convert the `Stream` into an `axum::body::HttpBody`
+    let body = axum::body::Body::from_stream(stream);
+
+    // let file = ServeFile::new(transcoded_path).oneshot();
+
+    let mut headers = HeaderMap::new();
+    headers.append(
+        http::header::CONTENT_TYPE,
+        http::header::HeaderValue::from_str("video/mp4").map_err(internal_error)?,
+    );
+
+    // Ok(([(http::header::CONTENT_TYPE, "video/mp4")], file))
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"video.mp4\"",
+        )
+        .body(body)
+        .map_err(internal_error)
 }
 
 #[axum::debug_handler]

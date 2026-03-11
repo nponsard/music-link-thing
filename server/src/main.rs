@@ -15,7 +15,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use deadpool_diesel::{InteractError, Pool, PoolError};
-use diesel::{prelude::*, result};
+use diesel::{expression::is_aggregate::No, prelude::*, result};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use dotenvy::dotenv;
 use sha2::{Digest, Sha256};
@@ -114,8 +114,8 @@ async fn process_link(
                 .execute(conn)
         })
         .await
-        .map_err(|e| CustomErrors::Deadpool(e))?
-        .map_err(|e| CustomErrors::Diesel(e))?;
+        .map_err(CustomErrors::Deadpool)?
+        .map_err(CustomErrors::Diesel)?;
 
         return Ok(());
     }
@@ -160,8 +160,8 @@ async fn process_link(
                 .load::<Link>(conn)
         })
         .await
-        .map_err(|e| CustomErrors::Deadpool(e))?
-        .map_err(|e| CustomErrors::Diesel(e))?;
+        .map_err(CustomErrors::Deadpool)?
+        .map_err(CustomErrors::Diesel)?;
     conn.interact(|conn| {
         diesel::update(links::dsl::links)
             .filter(links::dsl::id.eq(id))
@@ -169,8 +169,8 @@ async fn process_link(
             .execute(conn)
     })
     .await
-    .map_err(|e| CustomErrors::Deadpool(e))?
-    .map_err(|e| CustomErrors::Diesel(e))?;
+    .map_err(CustomErrors::Deadpool)?
+    .map_err(CustomErrors::Diesel)?;
 
     debug!("transcoding {}", &transcode_path.to_string_lossy());
 
@@ -256,6 +256,9 @@ async fn process_link(
                     .arg("[0:a]a3dscope=s=848x480:r=24");
                 complex_filter = true;
             }
+            fs::remove_file(image_path)
+                .await
+                .map_err(|e| CustomErrors::Custom(e.to_string()))?;
         }
 
         if !complex_filter {
@@ -274,9 +277,9 @@ async fn process_link(
             .arg("-crf")
             .arg("28")
             .arg("-c:a")
-            .arg("libopus")
+            .arg("aac")
             .arg("-b:a")
-            .arg("192k")
+            .arg("280k")
             .arg("-f")
             .arg("mp4")
             .arg(&transcode_path);
@@ -309,9 +312,38 @@ async fn tasks_manager(
         let result = process_link(&pool, &link, &download_folder, &transcode_folder).await;
         debug!("processing result: {:?}", result);
 
-        if let Err(e) = result {
-            error!("Failed to process link {},{:?}", link.url, e)
-        }
+        match pool.get().await {
+            Ok(conn) => {
+                let id = link.id;
+                let url = link.url;
+                if let Err(e) = conn
+                    .interact(move |conn| {
+                        let res = if let Err(e) = result {
+                            error!("Failed to process link {},{:?}", url, e);
+                            diesel::update(schema::links::dsl::links)
+                                .filter(schema::links::dsl::id.eq(id))
+                                .set(schema::links::dsl::error.eq(format!("{:?}", e)))
+                                .execute(conn)
+                        } else {
+                            diesel::update(schema::links::dsl::links)
+                                .filter(schema::links::dsl::id.eq(id))
+                                .set(schema::links::dsl::finished.eq(true))
+                                .execute(conn)
+                        };
+
+                        if let Err(e) = res {
+                            error!("Error updating database: {}", e);
+                        }
+                    })
+                    .await
+                {
+                    error!("Error updating database: {}", e);
+                };
+            }
+            Err(e) => {
+                error!("Failed to open conn: {}", e);
+            }
+        };
     }
 }
 
@@ -439,8 +471,7 @@ async fn create_link(
     let link = Link {
         url: new_link.url,
         id: hex::encode(Uuid::new_v4().as_bytes()),
-        original_hash: None,
-        transcoded_hash: None,
+        ..Default::default()
     };
     let res = conn
         .interact(|conn| {
@@ -493,8 +524,7 @@ async fn direct_request(
         let link = Link {
             url,
             id: hex::encode(Uuid::new_v4().as_bytes()),
-            original_hash: None,
-            transcoded_hash: None,
+            ..Default::default()
         };
 
         let link_insert = link.clone();

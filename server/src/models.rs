@@ -1,7 +1,7 @@
 use diesel::prelude::*;
 use serde::Serialize;
 
-#[derive(Queryable, Selectable, Serialize, Insertable, Clone, Debug)]
+#[derive(Queryable, Selectable, Serialize, Insertable, Clone, Debug, Default)]
 #[diesel(table_name = crate::schema::links)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Link {
@@ -9,4 +9,6 @@ pub struct Link {
     pub url: String,
     pub original_hash: Option<String>,
     pub transcoded_hash: Option<String>,
+    pub error: Option<String>,
+    pub finished: bool,
 }

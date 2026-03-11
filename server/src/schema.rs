@@ -6,5 +6,7 @@ diesel::table! {
         url -> Text,
         original_hash -> Nullable<Text>,
         transcoded_hash -> Nullable<Text>,
+        error -> Nullable<Text>,
+        finished -> Bool,
     }
 }

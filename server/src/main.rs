@@ -176,6 +176,9 @@ async fn process_link(
 
     debug!("transcoding {}", &transcode_path.to_string_lossy());
 
+    let mut image_path = PathBuf::from(&download_path);
+    image_path.add_extension("png");
+
     if !result.is_empty() {
         let other_link = result.first().unwrap();
         let other_transcode_path = PathBuf::from(transcode_folder).join(other_link.id.as_str());
@@ -220,9 +223,6 @@ async fn process_link(
         if video_stream.is_none()
         // && let Some(audio_stream) = audio_stream
         {
-            let mut image_path = PathBuf::from(&download_path);
-            image_path.add_extension("png");
-
             let out = Command::new("ffmpeg")
                 .arg("-i")
                 .arg(&download_path)
@@ -258,9 +258,6 @@ async fn process_link(
                     .arg("[0:a]a3dscope=s=848x480:r=24");
                 complex_filter = true;
             }
-            fs::remove_file(image_path)
-                .await
-                .map_err(|e| CustomErrors::Custom(e.to_string()))?;
         }
 
         if !complex_filter {
@@ -294,12 +291,16 @@ async fn process_link(
             .map_err(|e| CustomErrors::Custom(e.to_string()))?;
 
         debug!("ffmpeg result: {:?}", result);
+        if !transcode_path.exists() {
+            return Err(CustomErrors::Custom(format!("ffmpeg failed: {:?}", result)));
+        }
     }
-
     fs::remove_file(download_path)
         .await
         .map_err(|e| CustomErrors::Custom(e.to_string()))?;
+    let image_result = fs::remove_file(image_path).await;
 
+    debug!("image delete result: {:?}", image_result);
     Ok(())
 }
 

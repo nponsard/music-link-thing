@@ -97,8 +97,9 @@ async fn process_link(
         .await
         .map_err(CustomErrors::Deadpool)?
         .map_err(CustomErrors::Diesel)?;
-    if !result.is_empty() {
-        let other_link = result.first().unwrap();
+    if let Some(other_link) = result.first()
+        && other_link.error.is_none()
+    {
         debug!("found similar link: {:?}", other_link);
         let other_transcode_path = PathBuf::from(transcode_folder).join(other_link.id.as_str());
         Command::new("cp")
@@ -107,6 +108,7 @@ async fn process_link(
             .arg(&transcode_path);
         let hash = other_link.original_hash.clone();
         let id = link.id.clone();
+
         conn.interact(|conn| {
             diesel::update(links::dsl::links)
                 .filter(links::dsl::id.eq(id))

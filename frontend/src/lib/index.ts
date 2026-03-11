@@ -3,6 +3,8 @@ interface Link {
 	id: string;
 	url: string;
 	original_hash: string;
+	error: string | undefined;
+	finished: boolean;
 }
 
 export function backend_url() {
@@ -29,6 +31,15 @@ export async function add_link(url: string): Promise<Link> {
 		headers: {
 			'Content-Type': 'application/json'
 		}
+	});
+	return await result.json();
+}
+
+export async function fetch_link(id: string): Promise<Link> {
+	const base = backend_url();
+
+	const result = await fetch(`${base}/api/link/${id}`, {
+		method: 'GET'
 	});
 	return await result.json();
 }

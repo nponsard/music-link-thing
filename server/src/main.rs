@@ -419,6 +419,7 @@ async fn main() {
     let api = Router::new()
         .route("/links", get(list_links))
         .route("/link", post(create_link))
+        .route("/link/{id}", get(show_link))
         .route("/link/{id}", delete(delete_link))
         .route("/direct/{*url}", get(direct_request))
         .with_state(AppState {
@@ -453,6 +454,32 @@ async fn list_links(
         .map_err(internal_error)?;
 
     Ok(Json(res))
+}
+
+async fn show_link(
+    State(app_state): State<AppState>,
+    extract::Path(link_id): extract::Path<String>,
+) -> Result<Json<Link>, (StatusCode, String)> {
+    use schema::links::dsl::*;
+
+    let conn = app_state.pool.get().await.map_err(internal_error)?;
+
+    let res = conn
+        .interact(|conn| {
+            links
+                .select(Link::as_select())
+                .filter(id.eq(link_id))
+                .load(conn)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+
+    if let Some(l) = res.first() {
+        Ok(Json(l.clone()))
+    } else {
+        Err((StatusCode::NOT_FOUND, "File not found".to_string()))
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -8,14 +8,14 @@ use axum::{
     Json, Router,
     extract::{self, RawQuery, State},
     http::{
-        self, HeaderMap, HeaderValue, Method, Response, StatusCode,
+        Method, Response, StatusCode,
         header::{self, CONTENT_TYPE},
     },
     response::IntoResponse,
     routing::{delete, get, post},
 };
 use deadpool_diesel::{InteractError, Pool, PoolError};
-use diesel::{expression::is_aggregate::No, prelude::*, result};
+use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use dotenvy::dotenv;
 use sha2::{Digest, Sha256};
@@ -571,18 +571,20 @@ async fn direct_request(
         link
     };
 
-    let res = process_link(
-        &app_state.pool,
-        &link,
-        &app_state.download_folder,
-        &app_state.transcode_folder,
-    )
-    .await;
+    if !link.finished {
+        let res = process_link(
+            &app_state.pool,
+            &link,
+            &app_state.download_folder,
+            &app_state.transcode_folder,
+        )
+        .await;
 
-    match res {
-        Ok(()) => {}
-        Err(e) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)));
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)));
+            }
         }
     }
 
@@ -599,20 +601,10 @@ async fn direct_request(
 
     // let file = ServeFile::new(transcoded_path).oneshot();
 
-    let mut headers = HeaderMap::new();
-    headers.append(
-        http::header::CONTENT_TYPE,
-        http::header::HeaderValue::from_str("video/mp4").map_err(internal_error)?,
-    );
-
     // Ok(([(http::header::CONTENT_TYPE, "video/mp4")], file))
 
     Response::builder()
         .header(header::CONTENT_TYPE, "video/mp4")
-        .header(
-            header::CONTENT_DISPOSITION,
-            "attachment; filename=\"video.mp4\"",
-        )
         .body(body)
         .map_err(internal_error)
 }
